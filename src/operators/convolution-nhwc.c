@@ -1900,12 +1900,14 @@ static enum xnn_status reshape_igemm(
          sizeof(convolution_op->dynamic_context.igemm->igemm.params));
 
   // Compute the optimal tile size for this iGEMM.
+  // Per-tap footprint is one channel group, not a full input row: m_stride
+  // must scale with channels, not image width, or wide inputs wrongly fail
+  // the cache-fit check and lose output-channel tiling.
   const size_t nc = xnn_gemm_best_tile_size(
       groups * batch_size, /*m=*/output_size,
       /*n=*/group_output_channels,
-      /*m_stride=*/kernel_size * sizeof(void*) +
-          (input_width * convolution_op->input_pixel_stride
-           << log2_input_element_size),
+      /*m_stride=*/kernel_size *
+          (sizeof(void*) + (group_input_channels << log2_input_element_size)),
       /*n_stride=*/convolution_op->dynamic_context.igemm->igemm.w_stride,
       /*cn_stride=*/1 << log2_output_element_size, mr, nr, num_threads);
 
