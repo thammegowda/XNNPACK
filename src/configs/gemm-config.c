@@ -460,6 +460,21 @@ static void init_bf16_f32_gemm_config(void) {
   const struct xnn_hardware_config* hardware_config = xnn_init_hardware_config();
   assert(hardware_config != NULL);
   (void) hardware_config;  // May be unused.
+  #if XNN_ENABLE_AVX512AMX && defined(XNN_ENABLE_F32_REDUCED) && XNN_ENABLE_F32_REDUCED
+  if (hardware_config->arch_flags & xnn_arch_x86_amx_bf16) {
+    for (size_t mr = 1; mr <= 16; ++mr) {
+      bf16_f32_gemm_config.minmax.gemm[XNN_MR_TO_INDEX(mr)] =
+          XNN_INIT_HMP_GEMM_UKERNEL(xnn_bf16_f32_gemm_minmax_ukernel_16x32c2__avx512amx);
+    }
+    bf16_f32_gemm_config.init.f32 = xnn_init_f32_minmax_scalar_params;
+    bf16_f32_gemm_config.pack_gemm_goi = (xnn_packw_gemm_goi_ukernel_fn) xnn_x16_x32_packw_gemm_goi_ukernel_x32c2__scalar;
+    bf16_f32_gemm_config.pack_gemm_gio = (xnn_packw_gemm_gio_ukernel_fn) xnn_x16_x32_packw_gemm_gio_ukernel_x32c2__scalar;
+    bf16_f32_gemm_config.mr = 16;
+    bf16_f32_gemm_config.nr = 32;
+    bf16_f32_gemm_config.log2_kr = 1;
+    bf16_f32_gemm_config.arch = xnn_arch_x86_amx_bf16;
+  } else
+  #endif
   if (XNN_ENABLE_AVX512BF16 && (hardware_config->arch_flags & xnn_arch_x86_avx512bf16)) {
     #if XNN_ENABLE_AVX512BF16 && XNN_ENABLE_ASSEMBLY
       bf16_f32_gemm_config.minmax.gemm[XNN_MR_TO_INDEX(1)] = XNN_INIT_HMP_GEMM_UKERNEL(xnn_bf16_f32_gemm_minmax_ukernel_1x32c2__asm_amd64_avx512bf16_broadcast);

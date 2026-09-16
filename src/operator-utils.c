@@ -4,6 +4,9 @@
 // LICENSE file in the root directory of this source tree.
 
 #include "src/xnnpack/operator-utils.h"
+#if defined(XNN_ENABLE_F32_REDUCED) && XNN_ENABLE_F32_REDUCED
+#include "src/xnnpack/fully-connected-reduced.h"
+#endif
 
 #include <assert.h>
 #include <stddef.h>
@@ -181,6 +184,11 @@ enum xnn_status xnn_destroy_operator(xnn_operator_t op)
     return xnn_status_invalid_parameter;
   }
 
+#if defined(XNN_ENABLE_F32_REDUCED) && XNN_ENABLE_F32_REDUCED
+  if (op->f32_reduced) {
+    xnn_destroy_fully_connected_nc_f32_reduced(op);
+  }
+#endif
   if (op->convolution_op) {
     xnn_release_memory(op->convolution_op->indirection_buffer);
     if (op->convolution_op->zero_buffers) {

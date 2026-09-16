@@ -30,6 +30,16 @@ extern "C" {
 DECLARE_BF16_F32_GEMM_MINMAX_UKERNEL_FUNCTION(
     xnn_bf16_f32_gemm_minmax_ukernel_1x4c2__scalar)
 DECLARE_BF16_F32_GEMM_MINMAX_UKERNEL_FUNCTION(
+    xnn_bf16_f32_gemm_minmax_ukernel_16x32c2__avx512amx)
+
+// Upstream YNNPACK dot bridge. M <= 32, K is even, strides are bytes. B uses
+// [K/2, N-padded, K-pair] packing. Optional residual planes must both be null
+// (plain BF16) or non-null (high*high + low*high + high*low, FP32 accumulation).
+void xnn_bf16_f32_gemm_32x48__amx(
+    size_t m, size_t n, size_t k, const uint16_t* a_high,
+    const uint16_t* a_low, size_t a_stride, const uint16_t* b_high,
+    const uint16_t* b_low, size_t b_stride_k, float* c, size_t c_stride);
+DECLARE_BF16_F32_GEMM_MINMAX_UKERNEL_FUNCTION(
     xnn_bf16_f32_gemm_minmax_ukernel_1x16c2__asm_amd64_avx512bf16_broadcast)
 DECLARE_BF16_F32_GEMM_MINMAX_UKERNEL_FUNCTION(
     xnn_bf16_f32_gemm_minmax_ukernel_2x16c2__asm_amd64_avx512bf16_broadcast)

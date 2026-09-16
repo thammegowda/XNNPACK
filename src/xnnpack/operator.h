@@ -222,6 +222,9 @@ struct xnn_operator {
   size_t batch_size;
   size_t channels;
   struct xnn_convolution_operator* convolution_op;
+#if defined(XNN_ENABLE_F32_REDUCED) && XNN_ENABLE_F32_REDUCED
+  struct xnn_f32_reduced_context* f32_reduced;
+#endif
 
   size_t input_pixel_stride;
   size_t output_pixel_stride;

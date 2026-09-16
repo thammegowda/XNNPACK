@@ -16,6 +16,9 @@
 #include "include/xnnpack.h"
 #include "src/xnnpack/common.h"
 #include "src/xnnpack/compute.h"
+#if defined(XNN_ENABLE_F32_REDUCED) && XNN_ENABLE_F32_REDUCED
+#include "src/xnnpack/fully-connected-reduced.h"
+#endif
 #include "src/xnnpack/indirection.h"
 #include "src/xnnpack/log.h"
 #include "src/xnnpack/math.h"
@@ -2020,6 +2023,12 @@ enum xnn_status xnn_run_operator_with_index(xnn_operator_t op,
           xnn_microkernel_type_to_string(op->ukernel.type));
       return xnn_status_invalid_state;
   }
+
+#if defined(XNN_ENABLE_F32_REDUCED) && XNN_ENABLE_F32_REDUCED
+  if (op->f32_reduced) {
+    return xnn_run_fully_connected_nc_f32_reduced(op, threadpool);
+  }
+#endif
 
   uint32_t flags = PTHREADPOOL_FLAG_DISABLE_DENORMALS;
   if (op->flags & XNN_FLAG_DONT_SPIN_WORKERS) {

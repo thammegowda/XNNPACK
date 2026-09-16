@@ -11,6 +11,24 @@ tested regularly via GitHub Actions (see [build.yml](.github/workflows/build.yml
 
 ## Building with CMake, testing with CTest
 
+### Makefile goals
+
+From the XNNPACK root, use the [Makefile](Makefile) with CMake/CTest 3.26+ and
+Ninja. GCC 14+ enables the fork's AMX kernels on supported hardware:
+
+```sh
+make debug CC=gcc-14 CXX=g++-14
+make test
+make release CC=gcc-14 CXX=g++-14
+```
+
+`debug` builds with debug symbols and tests in `build/debug`. `test` runs those
+already-built tests without configuring or rebuilding. `release` builds optimized
+code without debug symbols or tests in `build/release`. Benchmarks and the separate
+YNNPACK runtime are not enabled. Dependencies download on first configuration.
+Optional overrides: `CMAKE_ARGS`, `BUILD_ARGS`, `CTEST_ARGS`
+(e.g. `'-R "^xnnpack[.]"'`), and `TEST_JOBS` (defaults to the host CPU count).
+
 ### Build without cross-compilation, default compiler
 `scripts/build-local.sh` automatically configures and runs CMake for the host
 CPU and operating system.

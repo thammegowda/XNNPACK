@@ -28,6 +28,9 @@
 #include "src/xnnpack/compute.h"
 #include "src/xnnpack/config-types.h"
 #include "src/xnnpack/config.h"
+#if defined(XNN_ENABLE_F32_REDUCED) && XNN_ENABLE_F32_REDUCED
+#include "src/xnnpack/fully-connected-reduced.h"
+#endif
 #include "src/xnnpack/internal.h"
 #include "src/xnnpack/log.h"
 #include "src/xnnpack/math.h"
@@ -2856,6 +2859,15 @@ enum xnn_status xnn_create_fully_connected_nc_f32(
     size_t output_stride, const float* kernel, const float* bias,
     float output_min, float output_max, uint32_t flags,
     xnn_weights_cache_t weights_cache, xnn_operator_t* fully_connected_op_out) {
+  if (flags & (XNN_FLAG_F32_COMPUTE_BF16 | XNN_FLAG_F32_COMPUTE_BF16X3)) {
+#if defined(XNN_ENABLE_F32_REDUCED) && XNN_ENABLE_F32_REDUCED
+    return xnn_create_fully_connected_nc_f32_reduced(
+        input_channels, output_channels, input_stride, output_stride, kernel,
+        bias, output_min, output_max, flags, weights_cache, fully_connected_op_out);
+#else
+    return xnn_status_unsupported_parameter;
+#endif
+  }
   struct fc_context context = {
       .input_channels = input_channels,
       .output_channels = output_channels,
@@ -3599,6 +3611,12 @@ enum xnn_status xnn_reshape_fully_connected_nc_bf16_f32(
 enum xnn_status xnn_reshape_fully_connected_nc_f32(
     xnn_operator_t fully_connected_op, size_t batch_size,
     pthreadpool_t threadpool) {
+#if defined(XNN_ENABLE_F32_REDUCED) && XNN_ENABLE_F32_REDUCED
+  if (fully_connected_op->f32_reduced) {
+    return xnn_reshape_fully_connected_nc_f32_reduced(
+        fully_connected_op, batch_size, threadpool);
+  }
+#endif
   return reshape_fully_connected_nc(
       fully_connected_op, xnn_operator_type_fully_connected_nc_f32, batch_size,
       /*dynamic_quantization=*/false,
@@ -4132,6 +4150,11 @@ enum xnn_status xnn_setup_fully_connected_nc_bf16_f32(
 
 enum xnn_status xnn_setup_fully_connected_nc_f32(
     xnn_operator_t fully_connected_op, const float* input, float* output) {
+#if defined(XNN_ENABLE_F32_REDUCED) && XNN_ENABLE_F32_REDUCED
+  if (fully_connected_op->f32_reduced) {
+    return xnn_setup_fully_connected_nc_f32_reduced(fully_connected_op, input, output);
+  }
+#endif
   return setup_fully_connected_nc(
       fully_connected_op, xnn_operator_type_fully_connected_nc_f32, input,
       output, /*workspace=*/NULL, /*row_sum=*/NULL,

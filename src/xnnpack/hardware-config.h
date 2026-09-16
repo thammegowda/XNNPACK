@@ -58,6 +58,7 @@ enum xnn_arch_flags {
   xnn_arch_x86_avx512vnni = 1 << 18,
   xnn_arch_x86_avx512vnnigfni = 1 << 19,
   xnn_arch_x86_avx512amx = 1 << 20,
+  xnn_arch_x86_amx_bf16 = 1 << 21,
 #elif XNN_ARCH_RISCV
   xnn_arch_riscv_vector = 1 << 0,
   xnn_arch_riscv_vector_fp16_arith = 1 << 1,
@@ -169,8 +170,8 @@ static inline bool xnn_is_bf16_compatible_config(
     const struct xnn_hardware_config* hardware_config) {
 #if (XNN_ARCH_ARM || XNN_ARCH_ARM64) && XNN_ENABLE_ARM_BF16
   return hardware_config->arch_flags & xnn_arch_arm_neon_bf16;
-#elif (XNN_ARCH_X86 || XNN_ARCH_X86_64) && XNN_ENABLE_AVX512BF16
-  return (hardware_config->arch_flags & xnn_arch_x86_avx512bf16);
+#elif (XNN_ARCH_X86 || XNN_ARCH_X86_64) && (XNN_ENABLE_AVX512BF16 || XNN_ENABLE_AVX512AMX)
+  return (hardware_config->arch_flags & (xnn_arch_x86_avx512bf16 | xnn_arch_x86_amx_bf16));
 #else
   return false;
 #endif

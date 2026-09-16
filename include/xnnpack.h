@@ -76,6 +76,19 @@ extern "C" {
 /// Assume transposed weights in a fully connected operator.
 #define XNN_FLAG_TRANSPOSE_WEIGHTS 0x00000001
 
+/// Opt-in BF16 products with FP32 inputs, weights, accumulation and outputs in
+/// xnn_create_fully_connected_nc_f32. Stored caller weights are never changed.
+/// Inputs outside the finite BF16 range use the ordinary FP32 operator.
+/// These modes read only the logical input channels; input tail padding is not
+/// required. Any staging needed by the strict fallback is owned by the operator.
+#define XNN_FLAG_F32_COMPUTE_BF16 0x00010000
+
+/// Three BF16 products: high*high + high*residual + residual*high. Mutually
+/// exclusive with F32_COMPUTE_BF16. Bias and clamping follow the FP32 sum.
+/// SLOW_CONSISTENT_ARITHMETIC selects the portable FP32-product fallback for
+/// both reduced modes, independently of AMX availability.
+#define XNN_FLAG_F32_COMPUTE_BF16X3 0x00020000
+
 /// The operator assumes NHWC layout for the input, regardless of the output layout.
 #define XNN_FLAG_INPUT_NHWC 0x00000002
 
