@@ -30,6 +30,7 @@
 #include "ynnpack/subgraph/elementwise.h"
 #include "ynnpack/subgraph/fusion_lut.h"
 #include "ynnpack/subgraph/fusion_types.h"
+#include "ynnpack/subgraph/gather.h"
 #include "ynnpack/subgraph/reduce.h"
 #include "ynnpack/subgraph/static_transpose.h"
 #include "ynnpack/subgraph/stencil_copy.h"
@@ -94,8 +95,10 @@ bool is_layout_transform(const ynn_node& node) {
 // If `node` is a linear expression of scalar constants, returns
 // `scalar_arithmetic` describing the operation.
 std::optional<scalar_arithmetic> is_scalar_arithmetic(
-    const ynn_subgraph& subgraph, subgraph_analysis& analysis, ynn_node& node) {
+    const ynn_subgraph& subgraph, subgraph_analysis& analysis, ynn_node& node,
+    bool allow_layout_transform = false) {
   if (is_layout_transform(node)) {
+    if (!allow_layout_transform) return std::nullopt;
     // If this is a layout transform, scalar arithmetic is invariant, so we can
     // skip it.
     ynn_node* producer = analysis.producer_of(node.inputs[0]);
@@ -105,7 +108,8 @@ std::optional<scalar_arithmetic> is_scalar_arithmetic(
         subgraph.value(output_id).is_external_output()) {
       return std::nullopt;
     }
-    return is_scalar_arithmetic(subgraph, analysis, *producer);
+    return is_scalar_arithmetic(subgraph, analysis, *producer,
+                                allow_layout_transform);
   }
   if (const auto* ternary =
           std::get_if<ynn_node::ternary_elementwise>(&node.op)) {
@@ -194,24 +198,25 @@ bool replace_uses(subgraph_analysis& analysis, ynn_subgraph& subgraph,
     if (!subgraph.value(to_id).is_external()) {
       if (ynn_node* producer = analysis.producer_of(to_id)) {
         // Redefine the producer of `to_id` to produce `from_id` instead.
-        for (uint32_t& o : producer->outputs) {
-          if (o == to_id) o = from_id;
-        }
+        analysis.invalidate_node(node);
+        analysis.update_node(*producer, [&]() {
+          for (uint32_t& o : producer->outputs) {
+            if (o == to_id) o = from_id;
+          }
+        });
         // Update consumers of the producer.
         replace_uses(analysis, subgraph, *producer, to_id, from_id);
         return true;
       }
     }
     YNN_LOG_DEBUG() << "Replacing node " << node.to_string() << " with copy";
-    ynn::define_copy(subgraph, node, to_id, from_id, /*flags=*/0);
+    analysis.update_node(node, [&]() {
+      ynn::define_copy(subgraph, node, to_id, from_id, /*flags=*/0);
+    });
     return false;
   } else {
     YNN_LOG_DEBUG() << "Replacing uses of " << from_id << " with " << to_id;
-    for (ynn_node* consumer : analysis.consumers[from_id]) {
-      for (uint32_t& i : consumer->inputs) {
-        if (i == from_id) i = to_id;
-      }
-    }
+    analysis.replace_all_uses(from_id, to_id);
     return true;
   }
 }
@@ -304,8 +309,10 @@ bool rewrite_multiply_reciprocal(ynn_subgraph& subgraph, ynn_node& node,
 
   if (divide_kernel != nullptr) {
     YNN_LOG_DEBUG() << "Rewriting x * (1/y) to x / y";
-    ynn::define_binary(subgraph, node, x.id, y.id, output.id, ynn_binary_divide,
-                       divide_kernel);
+    analysis.update_node(node, [&]() {
+      ynn::define_binary(subgraph, node, x.id, y.id, output.id,
+                         ynn_binary_divide, divide_kernel);
+    });
     return true;
   }
 
@@ -414,8 +421,10 @@ bool rewrite_ternary(ynn_subgraph& subgraph, ynn_node& node,
         YNN_LOG_DEBUG() << "Rewriting " << to_string(outer->op) << "("
                         << to_string(inner) << "(a, b), c) to "
                         << to_string(r.op) << "(a, b, c)";
-        ynn::define_ternary(subgraph, node, a.id, b.id, c.id, x.id, r.op,
-                            kernel);
+        analysis.update_node(node, [&]() {
+          ynn::define_ternary(subgraph, node, a.id, b.id, c.id, x.id, r.op,
+                              kernel);
+        });
         return true;
       }
     } while (std::next_permutation(perm, perm + 3));
@@ -455,8 +464,10 @@ bool rewrite_binary_convert(ynn_subgraph& subgraph, ynn_node& node,
       YNN_LOG_DEBUG() << "Rewriting " << to_string(binary->op)
                       << "(convert(x), convert(x)) to " << to_string(binary->op)
                       << "(x, x)";
-      ynn::define_binary(subgraph, node, a.id, b.id, output.id, binary->op,
-                         kernel);
+      analysis.update_node(node, [&]() {
+        ynn::define_binary(subgraph, node, a.id, b.id, output.id, binary->op,
+                           kernel);
+      });
       return true;
     }
     return false;
@@ -470,8 +481,10 @@ bool rewrite_binary_convert(ynn_subgraph& subgraph, ynn_node& node,
       YNN_LOG_DEBUG() << "Rewriting " << to_string(binary->op)
                       << "(convert(x), convert(y)) to " << to_string(binary->op)
                       << "(x, y)";
-      ynn::define_binary(subgraph, node, a.id, b.id, output.id, binary->op,
-                         kernel);
+      analysis.update_node(node, [&]() {
+        ynn::define_binary(subgraph, node, a.id, b.id, output.id, binary->op,
+                           kernel);
+      });
       return true;
     }
   }
@@ -487,9 +500,11 @@ bool rewrite_binary_convert(ynn_subgraph& subgraph, ynn_node& node,
       YNN_LOG_DEBUG() << "Rewriting " << to_string(binary->op)
                       << "(convert(x), y) to " << to_string(binary->op)
                       << "(x, y)";
-      ynn::define_binary(subgraph, node, i == 0 ? a.id : node.inputs[0],
-                         i == 1 ? b.id : node.inputs[1], output.id, binary->op,
-                         kernel);
+      analysis.update_node(node, [&]() {
+        ynn::define_binary(subgraph, node, i == 0 ? a.id : node.inputs[0],
+                           i == 1 ? b.id : node.inputs[1], output.id,
+                           binary->op, kernel);
+      });
       return true;
     }
   }
@@ -521,8 +536,10 @@ bool rewrite_convert_elementwise(ynn_subgraph& subgraph, ynn_node& node,
     YNN_LOG_DEBUG() << "Rewriting "
                     << "convert(" << to_string(unary->op) << "(a)) to "
                     << to_string(unary->op) << "(a)";
-    ynn::define_unary(subgraph, node, a.id, x.id, unary->op, kernel,
-                      unary->params);
+    analysis.update_node(node, [&]() {
+      ynn::define_unary(subgraph, node, a.id, x.id, unary->op, kernel,
+                        unary->params);
+    });
     return true;
   } else if (const auto* binary =
                  std::get_if<ynn_node::binary_elementwise>(&producer->op)) {
@@ -536,7 +553,9 @@ bool rewrite_convert_elementwise(ynn_subgraph& subgraph, ynn_node& node,
     YNN_LOG_DEBUG() << "Rewriting "
                     << "convert(" << to_string(binary->op) << "(a, b)) to "
                     << to_string(binary->op) << "(a, b)";
-    ynn::define_binary(subgraph, node, a.id, b.id, x.id, binary->op, kernel);
+    analysis.update_node(node, [&]() {
+      ynn::define_binary(subgraph, node, a.id, b.id, x.id, binary->op, kernel);
+    });
     return true;
   } else if (const auto* ternary =
                  std::get_if<ynn_node::ternary_elementwise>(&producer->op)) {
@@ -551,8 +570,10 @@ bool rewrite_convert_elementwise(ynn_subgraph& subgraph, ynn_node& node,
     YNN_LOG_DEBUG() << "Rewriting "
                     << "convert(" << to_string(ternary->op) << "(a, b, c)) to "
                     << to_string(ternary->op) << "(a, b, c)";
-    ynn::define_ternary(subgraph, node, a.id, b.id, c.id, x.id, ternary->op,
-                        kernel);
+    analysis.update_node(node, [&]() {
+      ynn::define_ternary(subgraph, node, a.id, b.id, c.id, x.id, ternary->op,
+                          kernel);
+    });
     return true;
   }
   return false;
@@ -578,8 +599,10 @@ bool rewrite_negate_multiply(ynn_subgraph& subgraph, ynn_node& node,
     if (kernel != nullptr) {
       YNN_LOG_DEBUG()
           << "Rewriting -multiply(b, c) to ternary subtract_multiply";
-      ynn::define_ternary(subgraph, node, a.id, b.id, c.id, x.id,
-                          ynn::ternary_op::subtract_multiply, kernel);
+      analysis.update_node(node, [&]() {
+        ynn::define_ternary(subgraph, node, a.id, b.id, c.id, x.id,
+                            ynn::ternary_op::subtract_multiply, kernel);
+      });
       return true;
     }
   }
@@ -619,10 +642,11 @@ bool rewrite_exp_subtract(ynn_subgraph& subgraph, ynn_node& node,
       ynn_binary_exp_subtract, a.type, b.type, output.type);
   if (kernel != nullptr) {
     YNN_LOG_DEBUG() << "Rewriting exp(subtract(a, b)) to exp_subtract(a, b)";
-    ynn::define_binary(subgraph, node, a.id, b.id, output.id,
-                       ynn_binary_exp_subtract, kernel);
-    producer->invalidate();
-    analysis.invalidate();
+    analysis.update_node(node, [&]() {
+      ynn::define_binary(subgraph, node, a.id, b.id, output.id,
+                         ynn_binary_exp_subtract, kernel);
+    });
+    analysis.invalidate_node(*producer);
     return true;
   }
   return false;
@@ -641,7 +665,7 @@ bool rewrite_get_tensor_shape_of_unary(ynn_subgraph& subgraph, ynn_node& node,
     // This is a get_tensor_shape of a unary elementwise op.
     YNN_LOG_DEBUG() << "Rewriting get_tensor_shape(unary_elementwise(x)) to "
                        "get_tensor_shape(x)";
-    node.inputs[0] = producer->inputs[0];
+    analysis.replace_input_id(node, node.inputs[0], producer->inputs[0]);
     return true;
   }
   return false;
@@ -812,14 +836,8 @@ bool remove_broadcast(ynn_subgraph& subgraph, ynn_node& node,
     // This broadcast is a no-op, replace consumers with our input, and remove
     // the op.
     YNN_LOG_DEBUG() << "Removing broadcast";
-    for (ynn_node* i : consumers) {
-      for (uint32_t& id : i->inputs) {
-        if (id == node.outputs[0]) {
-          id = node.inputs[0];
-        }
-      }
-    }
-    node.invalidate();
+    analysis.replace_all_uses(node.outputs[0], node.inputs[0]);
+    analysis.invalidate_node(node);
     return true;
   }
   return simplified;
@@ -865,14 +883,8 @@ bool remove_broadcast_expand_dims(ynn_subgraph& subgraph, ynn_node& node,
   // This broadcast is a no-op, replace consumers with our input, and remove
   // the op.
   YNN_LOG_DEBUG() << "Removing expand_dims";
-  for (ynn_node* i : consumers) {
-    for (uint32_t& id : i->inputs) {
-      if (id == node.outputs[0]) {
-        id = node.inputs[0];
-      }
-    }
-  }
-  node.invalidate();
+  analysis.replace_all_uses(node.outputs[0], node.inputs[0]);
+  analysis.invalidate_node(node);
   return true;
 }
 
@@ -935,7 +947,7 @@ bool remove_static_broadcast_from_elementwise(ynn_subgraph& subgraph,
     };
     if (!any_n(broadcast->new_dims.size(), broadcast_needed)) {
       YNN_LOG_DEBUG() << "Removing static_broadcast from elementwise input.";
-      input_id = producer->inputs[0];
+      analysis.replace_input_id(node, input_id, producer->inputs[0]);
       change = true;
     }
   }
@@ -951,6 +963,7 @@ bool rewrite_transpose_stencil_copy(ynn_subgraph& subgraph, ynn_node& node,
   if (transpose_a == nullptr) {
     return false;
   }
+  const int tile_m = transpose_a->tile_m;
   const int tile_k = transpose_a->tile_k;
   const int m_dim = transpose_a->m_dim;
 
@@ -1004,14 +1017,27 @@ bool rewrite_transpose_stencil_copy(ynn_subgraph& subgraph, ynn_node& node,
     }
   }
 
+  for (const ynn_node::stencil_copy::stencil& stencil : stencil_copy.stencils) {
+    if (stencil.axis == new_m_dim) {
+      if (stencil.dilation % tile_m != 0) {
+        YNN_LOG_DEBUG() << "Stencil dilation on transposed m dimension is not "
+                           "divisible by tile_m.";
+        return false;
+      }
+    }
+  }
+
   YNN_LOG_DEBUG() << "Rewriting transpose_a(stencil_copy(x)) to "
                      "stencil_copy(transpose_a(x))";
 
-  // transpose_a inserts a new dimension 0, update our stencil dimensions to
-  // account for this.
+  // transpose_a inserts new dimensions at 0 and 1, update our stencil
+  // dimensions to account for this.
   for (ynn_node::stencil_copy::stencil& stencil : stencil_copy.stencils) {
-    stencil.axis++;
-    stencil.new_axis++;
+    if (stencil.axis == new_m_dim) {
+      stencil.dilation /= tile_m;
+    }
+    stencil.axis += 2;
+    stencil.new_axis += 2;
   }
 
   uint32_t stencil_input_id = stencil_node->inputs[0];
@@ -1022,15 +1048,19 @@ bool rewrite_transpose_stencil_copy(ynn_subgraph& subgraph, ynn_node& node,
 
   // Replace stencil_copy(x) with transpose_a'(x), reusing the stencil_node's x
   // input and y output.
-  ynn::define_transpose_a(subgraph, *stencil_node, tile_k, new_m_dim,
-                          stencil_input_id, stencil_output_id);
+  analysis.update_node(*stencil_node, [&]() {
+    ynn::define_transpose_a(subgraph, *stencil_node, tile_m, tile_k, new_m_dim,
+                            stencil_input_id, stencil_output_id);
+  });
 
   uint32_t output_id = node.outputs[0];
   // Replace transpose_a(x) with stencil_copy'(transpose_a'(x)), reusing
   // transpose_a's output.
-  ynn::define_stencil_copy(subgraph, node, std::move(stencil_copy),
-                           stencil_output_id, stencil_padding_id, &output_id,
-                           /*flags=*/0);
+  analysis.update_node(node, [&]() {
+    ynn::define_stencil_copy(subgraph, node, std::move(stencil_copy),
+                             stencil_output_id, stencil_padding_id, &output_id,
+                             /*flags=*/0);
+  });
 
   return true;
 }
@@ -1110,12 +1140,12 @@ bool rewrite_expand_dims_reduce(ynn_subgraph& subgraph, ynn_node& node,
   YNN_LOG_DEBUG() << "Fusing expand_dims and " << to_string(reduce->op)
                   << " to " << to_string(reduce->op) << "(keep_dims=true)";
 
-  std::get<ynn_node::reduce>(producer->op).keep_dims = true;
-  producer->outputs[0] = node.outputs[0];
   if (producer->inputs[1] != YNN_INVALID_VALUE_ID) {
     const ynn_value& init = subgraph.value(producer->inputs[1]);
     if (!is_expand_dims_noop(init, *expand_dims_axes)) {
       // We need to move the expand_dims to the initializer input.
+      std::get<ynn_node::reduce>(producer->op).keep_dims = true;
+      producer->outputs[0] = node.outputs[0];
       uint32_t expanded_id = node.inputs[0];
       ynn::define_static_expand_dims(subgraph, node, producer->inputs[1],
                                      &expanded_id, *expand_dims_axes);
@@ -1125,7 +1155,12 @@ bool rewrite_expand_dims_reduce(ynn_subgraph& subgraph, ynn_node& node,
       return true;
     }
   }
-  node.invalidate();
+  uint32_t final_output_id = node.outputs[0];
+  analysis.invalidate_node(node);
+  analysis.update_node(*producer, [&]() {
+    std::get<ynn_node::reduce>(producer->op).keep_dims = true;
+    producer->outputs[0] = final_output_id;
+  });
   return true;
 }
 
@@ -1178,15 +1213,14 @@ bool rewrite_reduce_sum_of_squared(ynn_subgraph& subgraph, ynn_node& node,
     assert(copy);
     assert(analysis.consumers[copy->outputs[0]].size() == 1 &&
            !subgraph.value(copy->outputs[0]).is_external_output());
-    copy->inputs[0] = mul_node->inputs[0];
+    analysis.replace_input(*copy, 0, mul_node->inputs[0]);
   } else {
     // The reduce is consuming the multiply, just consume x instead.
-    node.inputs[0] = x_id;
+    analysis.replace_input(node, 0, x_id);
   }
 
   YNN_LOG_DEBUG() << "Rewriting reduce_sum(x*x) to reduce_sum_squared(x)";
   reduce_op->op = ynn_reduce_sum_squared;
-
   return true;
 }
 
@@ -1217,7 +1251,7 @@ bool rewrite_reduce_convert(ynn_subgraph& subgraph, ynn_node& node,
   YNN_LOG_DEBUG() << "Rewriting reduce(" << to_string(reduce_op->op)
                   << ", convert(x)) to reduce(" << to_string(reduce_op->op)
                   << ", x)";
-  node.inputs[0] = x.id;
+  analysis.replace_input(node, 0, x.id);
   return true;
 }
 
@@ -1251,8 +1285,10 @@ bool fuse_converts(ynn_subgraph& subgraph, ynn_node& node,
       if (kernel) {
         YNN_LOG_DEBUG() << "Rewriting convert(" << to_string(input.type)
                         << ", convert(bf16, x)) to round_to_bf16(x)";
-        define_unary(subgraph, node, producer->inputs[0], node.outputs[0],
-                     ynn_unary_round_to_bf16, kernel);
+        analysis.update_node(node, [&]() {
+          define_unary(subgraph, node, producer->inputs[0], node.outputs[0],
+                       ynn_unary_round_to_bf16, kernel);
+        });
         return true;
       }
     }
@@ -1270,7 +1306,7 @@ bool fuse_converts(ynn_subgraph& subgraph, ynn_node& node,
                   << ", x)) to x";
 
   if (replace_uses(analysis, subgraph, node, output.id, input.id)) {
-    node.invalidate();
+    analysis.invalidate_node(node);
   }
   return true;
 }
@@ -1316,7 +1352,7 @@ bool fuse_quantize(ynn_subgraph& subgraph, ynn_node& node,
   YNN_LOG_DEBUG() << "Rewriting dequantize(quantize(x)) to x";
 
   if (replace_uses(analysis, subgraph, node, output.id, input.id)) {
-    node.invalidate();
+    analysis.invalidate_node(node);
   }
   return true;
 }
@@ -1366,20 +1402,19 @@ bool rewrite_dequantize_dot(ynn_subgraph& subgraph, ynn_node& node,
                      "c, d) to dequantize_dot";
 
   const ynn_value& output = subgraph.value(node.outputs[0]);
+  if (!get_dequantize_dot_kernel(output.type)) {
+    return false;
+  }
   uint32_t offset_id = subgraph.get_scalar_value_id(output.type, 0.0f);
 
-  uint32_t input1_id = dot_node->inputs[1];
-  dot_node->inputs[2] = YNN_INVALID_VALUE_ID;
-  bool result = ynn::define_dequantize_dot(
-      subgraph, node, output.type, dot_node->outputs[0], a_offset_id,
-      b_offset_id, a_scale_id, b_scale_id, offset_id, node.outputs[0],
-      dequantize_dot_params{});
-  if (!result) {
-    // There is no kernel for dequantize_dot, so don't do rewrite and restore
-    // the old value.
-    dot_node->inputs[2] = input1_id;
-  }
-  return result;
+  analysis.replace_input(*dot_node, 2, YNN_INVALID_VALUE_ID);
+  analysis.update_node(node, [&]() {
+    ynn::define_dequantize_dot(subgraph, node, output.type,
+                               dot_node->outputs[0], a_offset_id, b_offset_id,
+                               a_scale_id, b_scale_id, offset_id,
+                               node.outputs[0], dequantize_dot_params{});
+  });
+  return true;
 }
 
 // Rewrite add(dequantize_dot(..., 0), x) to dequantize_dot(..., x)
@@ -1415,16 +1450,18 @@ bool rewrite_dequantize_dot_add(ynn_subgraph& subgraph, ynn_node& node,
         << "Rewriting add(dequantize_dot(..., 0), x) to dequantize_dot(..., x)";
 
     const ynn_value& output = subgraph.value(node.outputs[0]);
-    bool result = ynn::define_dequantize_dot(
-        subgraph, node, output.type, dequantize_dot_node->inputs[0],
-        dequantize_dot_node->inputs[1], dequantize_dot_node->inputs[2],
-        dequantize_dot_node->inputs[3], dequantize_dot_node->inputs[4],
-        new_offset_id, node.outputs[0], dequantize_dot_op->params);
+    bool result = analysis.update_node(node, [&]() {
+      return ynn::define_dequantize_dot(
+          subgraph, node, output.type, dequantize_dot_node->inputs[0],
+          dequantize_dot_node->inputs[1], dequantize_dot_node->inputs[2],
+          dequantize_dot_node->inputs[3], dequantize_dot_node->inputs[4],
+          new_offset_id, node.outputs[0], dequantize_dot_op->params);
+    });
 
     if (!result) {
       continue;
     }
-    dequantize_dot_node->invalidate();
+    analysis.invalidate_node(*dequantize_dot_node);
     return true;
   }
   return false;
@@ -1462,8 +1499,11 @@ bool rewrite_dequantize_dot_convert(ynn_subgraph& subgraph, ynn_node& node,
          "with type "
       << to_string(output.type);
 
-  dequantize_dot_node->outputs[0] = node.outputs[0];
-  node.invalidate();
+  uint32_t final_output_id = node.outputs[0];
+  analysis.invalidate_node(node);
+  analysis.update_node(*dequantize_dot_node, [&]() {
+    dequantize_dot_node->outputs[0] = final_output_id;
+  });
   return true;
 }
 
@@ -1504,8 +1544,10 @@ bool rewrite_ternary_convert(ynn_subgraph& subgraph, ynn_node& node,
     YNN_LOG_DEBUG() << "Rewriting " << to_string(ternary->op)
                     << "(convert(x), ...) to " << to_string(ternary->op)
                     << "(x, ...)";
-    ynn::define_ternary(subgraph, node, a.id, b.id, c.id, output.id,
-                        ternary->op, kernel);
+    analysis.update_node(node, [&]() {
+      ynn::define_ternary(subgraph, node, a.id, b.id, c.id, output.id,
+                          ternary->op, kernel);
+    });
     return true;
   }
 
@@ -1525,8 +1567,10 @@ bool rewrite_ternary_convert(ynn_subgraph& subgraph, ynn_node& node,
       YNN_LOG_DEBUG() << "Rewriting " << to_string(ternary->op)
                       << "(convert(x), ...) to " << to_string(ternary->op)
                       << "(x, ...)";
-      ynn::define_ternary(subgraph, node, ta.id, tb.id, tc.id, output.id,
-                          ternary->op, kernel);
+      analysis.update_node(node, [&]() {
+        ynn::define_ternary(subgraph, node, ta.id, tb.id, tc.id, output.id,
+                            ternary->op, kernel);
+      });
       return true;
     }
   }
@@ -1559,7 +1603,8 @@ bool fold_unary_input(ynn_subgraph& subgraph, ynn_node& node,
   if (!producer) {
     return false;
   }
-  if (auto mul = is_scalar_arithmetic(subgraph, analysis, *producer)) {
+  if (auto mul = is_scalar_arithmetic(subgraph, analysis, *producer,
+                                      /*allow_layout_transform=*/true)) {
     if (mul->b != 0.0f) {
       switch (unary->op) {
         case ynn_unary_rsqrt:
@@ -1605,17 +1650,18 @@ bool fold_unary_input(ynn_subgraph& subgraph, ynn_node& node,
     // nodes. This may not be the immediate producers of this op.
     uint32_t output_id = mul->producer->outputs[0];
     if (input_type != folded_type) {
-      define_unary(subgraph, *mul->producer, x_id, output_id, ynn_unary_convert,
-                   convert_kernel);
+      analysis.update_node(*mul->producer, [&]() {
+        define_unary(subgraph, *mul->producer, x_id, output_id,
+                     ynn_unary_convert, convert_kernel);
+      });
     } else {
       ynn_node* consumer = &node;
       if (producer != mul->producer) {
         consumer = analysis.consumers[output_id].front();
       }
-      consumer->inputs[0] = x_id;
+      analysis.replace_input(*consumer, 0, x_id);
     }
 
-    analysis.invalidate();
     return true;
   }
   return false;
@@ -1625,7 +1671,7 @@ bool fold_unary_input(ynn_subgraph& subgraph, ynn_node& node,
 bool fold_unary_output(ynn_subgraph& subgraph, ynn_node& node,
                        subgraph_analysis& analysis) {
   auto scalar_arithmetic = is_scalar_arithmetic(subgraph, analysis, node);
-  if (!scalar_arithmetic) return false;
+  if (!scalar_arithmetic || scalar_arithmetic->producer != &node) return false;
 
   ynn_node* producer = analysis.producer_of(scalar_arithmetic->x_id);
   if (producer == nullptr) return false;
@@ -1680,14 +1726,17 @@ bool fold_unary_output(ynn_subgraph& subgraph, ynn_node& node,
   unary->params.poly3.c0 += scalar_arithmetic->b;
 
   if (folded_type != output_type) {
-    define_unary(subgraph, node, producer->outputs[0], node.outputs[0],
-                 ynn_unary_convert, convert_kernel);
+    analysis.update_node(node, [&]() {
+      define_unary(subgraph, node, producer->outputs[0], node.outputs[0],
+                   ynn_unary_convert, convert_kernel);
+    });
   } else {
-    producer->outputs[0] = node.outputs[0];
-    node.invalidate();
+    uint32_t final_output_id = node.outputs[0];
+    analysis.invalidate_node(node);
+    analysis.update_node(*producer,
+                         [&]() { producer->outputs[0] = final_output_id; });
   }
 
-  analysis.invalidate();
   return true;
 }
 
@@ -1697,7 +1746,7 @@ bool fold_iota_output(ynn_subgraph& subgraph, ynn_node& node,
   // iota supports dynamic begin/stride values too, so we could also fold non-
   // constant arithmetic into it, but it's messier to do that...
   auto scalar_arithmetic = is_scalar_arithmetic(subgraph, analysis, node);
-  if (!scalar_arithmetic) return false;
+  if (!scalar_arithmetic || scalar_arithmetic->producer != &node) return false;
 
   ynn_node* producer = analysis.producer_of(scalar_arithmetic->x_id);
   if (!producer || !std::holds_alternative<ynn_node::iota>(producer->op)) {
@@ -1717,12 +1766,14 @@ bool fold_iota_output(ynn_subgraph& subgraph, ynn_node& node,
     }
   }
 
-  node = *producer;
-  node.outputs[0] = output_id;
-  ynn_node::iota& node_iota = std::get<ynn_node::iota>(node.op);
-  node_iota.params.scale *= scalar_arithmetic->a;
-  node_iota.params.offset *= scalar_arithmetic->a;
-  node_iota.params.offset += scalar_arithmetic->b;
+  analysis.update_node(node, [&]() {
+    node = *producer;
+    node.outputs[0] = output_id;
+    ynn_node::iota& node_iota = std::get<ynn_node::iota>(node.op);
+    node_iota.params.scale *= scalar_arithmetic->a;
+    node_iota.params.offset *= scalar_arithmetic->a;
+    node_iota.params.offset += scalar_arithmetic->b;
+  });
   return true;
 }
 
@@ -1737,8 +1788,10 @@ bool rewrite_binary(ynn_subgraph& subgraph, ynn_node& node,
     if (!kernel) return false;
 
     YNN_LOG_DEBUG() << "Rewriting multiply(x, x) to square(x)";
-    define_unary(subgraph, node, node.inputs[0], node.outputs[0],
-                 ynn_unary_square, kernel);
+    analysis.update_node(node, [&]() {
+      define_unary(subgraph, node, node.inputs[0], node.outputs[0],
+                   ynn_unary_square, kernel);
+    });
     return true;
   }
   return false;
@@ -1783,8 +1836,10 @@ bool rewrite_reshape(ynn_subgraph& subgraph, ynn_node& node,
   }
 
   YNN_LOG_DEBUG() << "Rewriting reshape to static_transpose";
-  ynn::define_static_transpose(subgraph, node, std::move(permutation), input.id,
-                               &output.id);
+  analysis.update_node(node, [&]() {
+    ynn::define_static_transpose(subgraph, node, std::move(permutation),
+                                 input.id, &output.id);
+  });
   return true;
 }
 
@@ -1829,13 +1884,14 @@ bool rewrite_transpose_transpose(ynn_subgraph& subgraph, ynn_node& node,
 
   YNN_LOG_DEBUG() << "Rewriting transpose(transpose(x)) to transpose(x)";
 
+  bool alias = transpose1->alias && transpose2->alias;
   uint32_t output_id = node.outputs[0];
-  ynn::define_static_transpose(subgraph, node, std::move(combined_perm),
-                               producer->inputs[0], &output_id,
-                               transpose1->alias && transpose2->alias);
-
-  producer->invalidate();
-  analysis.invalidate();
+  uint32_t input_id = producer->inputs[0];
+  analysis.invalidate_node(*producer);
+  analysis.update_node(node, [&]() {
+    ynn::define_static_transpose(subgraph, node, std::move(combined_perm),
+                                 input_id, &output_id, alias);
+  });
   return true;
 }
 
@@ -1896,9 +1952,12 @@ bool rewrite_reduce_binary_identity(ynn_subgraph& subgraph, ynn_node& node,
     uint32_t x_id = producer->inputs[0];
     uint32_t output_id = node.outputs[0];
 
-    node = std::move(*producer);
-    node.inputs = {x_id, y_id};
-    node.outputs[0] = output_id;
+    analysis.remove_node(*producer);
+    analysis.update_node(node, [&]() {
+      node = std::move(*producer);
+      node.inputs = {x_id, y_id};
+      node.outputs[0] = output_id;
+    });
     producer->invalidate();
     return true;
   }
@@ -1977,23 +2036,28 @@ bool rewrite_reduce_static_transpose(ynn_subgraph& subgraph, ynn_node& node,
   }
 
   if (is_identity) {
-    transpose->invalidate();
-    node.checks.clear();
-    ynn::define_reduce(subgraph, node, op, new_axes, x_id, init_id, &y_id,
-                       keep_dims);
+    analysis.invalidate_node(*transpose);
+    analysis.update_node(node, [&]() {
+      node.checks.clear();
+      ynn::define_reduce(subgraph, node, op, new_axes, x_id, init_id, &y_id,
+                         keep_dims);
+    });
   } else {
     // Clear checks on the old nodes to avoid runtime failure
-    transpose->checks.clear();
-    node.checks.clear();
-
     // Redefine transpose node as reduce node
     uint32_t r_id = YNN_INVALID_VALUE_ID;
-    ynn::define_reduce(subgraph, *transpose, op, new_axes, x_id, init_id, &r_id,
-                       keep_dims);
+    analysis.update_node(*transpose, [&]() {
+      transpose->checks.clear();
+      ynn::define_reduce(subgraph, *transpose, op, new_axes, x_id, init_id,
+                         &r_id, keep_dims);
+    });
 
     // Redefine the old reduce node as a transpose node
-    ynn::define_static_transpose(subgraph, node, std::move(new_perm), r_id,
-                                 &y_id, alias);
+    analysis.update_node(node, [&]() {
+      node.checks.clear();
+      ynn::define_static_transpose(subgraph, node, std::move(new_perm), r_id,
+                                   &y_id, alias);
+    });
   }
 
   return true;
@@ -2025,6 +2089,7 @@ bool rewrite_transpose_broadcast(ynn_subgraph& subgraph, ynn_node& node,
 
   const size_t rank_y = broadcast->new_dims.size();
   std::vector<int32_t> perm = transpose->permutation;
+  bool alias = transpose->alias;
 
   const ynn_value& z = subgraph.value(z_id);
   std::vector<size_t> new_dims(z.rank());
@@ -2045,15 +2110,121 @@ bool rewrite_transpose_broadcast(ynn_subgraph& subgraph, ynn_node& node,
 
   // Redefine B (broadcast_node) to be T' (new_transpose)
   uint32_t y_prime_id = YNN_INVALID_VALUE_ID;
-  ynn::define_static_transpose(subgraph, *broadcast_node, std::move(perm), x_id,
-                               &y_prime_id, transpose->alias);
+  analysis.update_node(*broadcast_node, [&]() {
+    ynn::define_static_transpose(subgraph, *broadcast_node, std::move(perm),
+                                 x_id, &y_prime_id, alias);
+  });
 
   // Redefine T (node) to be B' (new_broadcast)
-  ynn::define_static_broadcast(subgraph, node, std::move(new_dims), y_prime_id,
-                               &z_id);
+  analysis.update_node(node, [&]() {
+    ynn::define_static_broadcast(subgraph, node, std::move(new_dims),
+                                 y_prime_id, &z_id);
+  });
 
+  return true;
+}
+
+bool is_constant_value(const ynn_subgraph& subgraph, uint32_t value_id,
+                       const subgraph_analysis& analysis) {
+  if (value_id == YNN_INVALID_VALUE_ID) return false;
+  const ynn_value& value = subgraph.value(value_id);
+  if (value.is_static()) return true;
+  if (value.is_external()) return false;
+  const ynn_node* producer = analysis.producer_of(value_id);
+  if (!producer) return false;
+  for (uint32_t input_id : producer->inputs) {
+    if (input_id != YNN_INVALID_VALUE_ID &&
+        !is_constant_value(subgraph, input_id, analysis)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Rewrite pack_b(gather(w, index, axes)) to
+// gather(pack_b(w), expand_dims(index), axes + 2)
+// where w is a constant tensor and all axes in gather are >= 2 (batch
+// dimensions).
+bool rewrite_pack_b_gather(ynn_subgraph& subgraph, ynn_node& node,
+                           subgraph_analysis& analysis) {
+  if (!std::holds_alternative<ynn_node::pack_b>(node.op)) return false;
+
+  ynn_node* producer = analysis.producer_of(node.inputs[0]);
+  if (!producer) return false;
+
+  const ynn_node::gather* gather_op =
+      std::get_if<ynn_node::gather>(&producer->op);
+  if (!gather_op) return false;
+
+  // Only rewrite if we won't break other consumers of the gather.
+  if (analysis.consumers[producer->outputs[0]].size() != 1 ||
+      subgraph.value(producer->outputs[0]).is_external_output()) {
+    return false;
+  }
+
+  // Check if gather axes are all >= 2 (batch dimensions in Slinky).
+  if (std::any_of(gather_op->axes.begin(), gather_op->axes.end(),
+                  [](int32_t axis) { return axis < 2; })) {
+    return false;
+  }
+
+  uint32_t w_id = producer->inputs[0];
+  uint32_t index_id = producer->inputs[1];
+  const ynn_value& w = subgraph.value(w_id);
+
+  // We only rewrite if the weights input is constant (so pack_b can be constant
+  // folded).
+  if (!is_constant_value(subgraph, w_id, analysis)) return false;
+
+  uint32_t packed_b_id = node.outputs[0];
+  const ynn_value& packed_b = subgraph.value(packed_b_id);
+
+  YNN_LOG_DEBUG()
+      << "Rewriting pack_b(gather(w, index)) to gather(pack_b(w), index)";
+
+  // 1. Shift gather axes by +2 (since pack_b expands dims 0, 1 into dims 0, 1,
+  // 2, 3)
+  std::vector<int32_t> new_axes = gather_op->axes;
+  for (int32_t& axis : new_axes) {
+    axis += 2;
+  }
+
+  // 2. Create a new value for packed_w
+  ynn_value& packed_w = subgraph.new_internal_value();
+  packed_w.type = w.type;
+  assert(packed_b.rank() >= 4);
+  packed_w.extents = {packed_b.extents[0], packed_b.extents[1],
+                      packed_b.extents[2], packed_b.extents[3]};
+  for (size_t d = 2; d < w.rank(); ++d) {
+    packed_w.extents.push_back(w.extents[d]);
+  }
+  uint32_t packed_w_id = packed_w.id;
+
+  // 3. Redefine producer (the old gather node) as pack_b(w)
+  producer->checks.clear();
+  producer->inputs = {w_id};
+  producer->outputs = {packed_w_id};
+  producer->op = ynn_node::pack_b{};
+  producer->create = node.create;
+
+  // 4. Expand index dimensions by inserting 2 unit dimensions at dims 0, 1 so
+  // that index batch dimensions align with packed_w batch dimensions (shifted
+  // by +2).
+  uint32_t new_index_id = YNN_INVALID_VALUE_ID;
+  ynn_node expand_node;
+  define_static_expand_dims(subgraph, expand_node, index_id, &new_index_id,
+                            /*new_axes=*/0b11);
+  subgraph.add_node(std::move(expand_node));
+
+  // 5. Redefine node (the old pack_b node) as gather(packed_w, new_index,
+  // new_axes)
+  node.checks.clear();
+  uint32_t output_id = packed_b_id;
+  define_gather(subgraph, node, std::move(new_axes), packed_b.rank(),
+                packed_w_id, new_index_id, output_id);
+
+  subgraph.topological_sort();
   analysis.invalidate();
-
   return true;
 }
 
@@ -2348,10 +2519,11 @@ bool rewrite_requantize_quantize(ynn_subgraph& subgraph, ynn_node& node,
   }
 
   // Redefine node as quantize_uint8
-  ynn::define_ternary(subgraph, node, input_id, scale_id, new_zp_id, output_id,
-                      ternary_op::quantize_uint8, kernel);
+  analysis.update_node(node, [&]() {
+    ynn::define_ternary(subgraph, node, input_id, scale_id, new_zp_id,
+                        output_id, ternary_op::quantize_uint8, kernel);
+  });
 
-  analysis.invalidate();
   return true;
 }
 
@@ -2368,7 +2540,7 @@ ynn_status ynn_subgraph::fusion() {
     for (ynn_node& node : nodes) {
       if (!node.is_valid()) continue;
 
-      changed = changed || ynn::fold_unary_input(*this, node, analysis) ||
+      changed = ynn::fold_unary_input(*this, node, analysis) ||
                 ynn::fold_unary_output(*this, node, analysis) ||
                 ynn::fold_iota_output(*this, node, analysis) ||
                 ynn::rewrite_binary(*this, node, analysis) ||
@@ -2398,9 +2570,10 @@ ynn_status ynn_subgraph::fusion() {
                 ynn::rewrite_reduce_sum_of_squared(*this, node, analysis) ||
                 ynn::rewrite_reduce_convert(*this, node, analysis) ||
                 ynn::rewrite_reduce_static_transpose(*this, node, analysis) ||
+                ynn::rewrite_pack_b_gather(*this, node, analysis) ||
                 ynn::rewrite_fast_math(*this, node, analysis) ||
                 ynn::rewrite_requantize_quantize(*this, node, analysis) ||
-                false;
+                changed;
 
       if (!analysis.is_valid) {
         break;
@@ -2421,8 +2594,8 @@ ynn_status ynn_subgraph::fusion() {
     for (ynn_node& node : nodes) {
       if (!node.is_valid()) continue;
 
-      changed = changed || ynn::fuse_converts(*this, node, analysis) ||
-                ynn::fuse_quantize(*this, node, analysis);
+      changed = ynn::fuse_converts(*this, node, analysis) ||
+                ynn::fuse_quantize(*this, node, analysis) || changed;
 
       if (!analysis.is_valid) {
         break;

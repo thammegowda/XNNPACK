@@ -143,6 +143,15 @@ class Buffer {
   // ```
   virtual bool IsA(internal::TypeId id) const = 0;
 
+  // Returns the size of the buffer in bytes.
+  //
+  // This is the size of the span returned by `Lock()` and `LockMutable()`.
+  //
+  // Note: implementations should be able to answer this **without locking**.
+  // The size is metadata that is expected to be available without making the
+  // data accessible from the CPU, which may be costly for non-CPU buffers.
+  virtual absl::StatusOr<size_t> ByteSize() const = 0;
+
   // Locks the buffer so that it's accessible from the CPU and returns an RAII
   // object that allows reading the data.
   //
@@ -204,12 +213,19 @@ class SpanCpuBuffer : public Buffer {
   explicit SpanCpuBuffer(const T (&arr)[N])
       : SpanCpuBuffer(reinterpret_cast<const std::byte*>(arr), sizeof(arr)) {}
 
-  internal::TypeId GetTypeId() const override {
+  // Returns the type id for this class.
+  static internal::TypeId TypeId() {
     return internal::TypeId::Get<SpanCpuBuffer>();
   }
-  bool IsA(internal::TypeId id) const override {
-    return id == internal::TypeId::Get<SpanCpuBuffer>();
-  }
+
+  // Returns the type id for this instance.
+  internal::TypeId GetTypeId() const override { return TypeId(); }
+
+  // Checks if this instance is of the given type id.
+  bool IsA(internal::TypeId id) const override { return id == TypeId(); }
+
+  // Returns the size of the buffer in bytes.
+  absl::StatusOr<size_t> ByteSize() const override { return size(); }
 
   // Locks the buffer so that it's accessible from the CPU and returns an RAII
   // object that allows reading the data.
@@ -258,12 +274,17 @@ class MutableSpanCpuBuffer : public SpanCpuBuffer {
   template <class T, size_t N>
   explicit MutableSpanCpuBuffer(const T (&arr)[N]) = delete;
 
-  internal::TypeId GetTypeId() const override {
+  // Returns the type id for this class.
+  static internal::TypeId TypeId() {
     return internal::TypeId::Get<MutableSpanCpuBuffer>();
   }
+
+  // Returns the type id for this instance.
+  internal::TypeId GetTypeId() const override { return TypeId(); }
+
+  // Checks if this instance is of the given type id.
   bool IsA(internal::TypeId id) const override {
-    return id == internal::TypeId::Get<MutableSpanCpuBuffer>() ||
-           SpanCpuBuffer::IsA(id);
+    return id == TypeId() || SpanCpuBuffer::IsA(id);
   }
 
   // Locks the buffer so that it's accessible from the CPU and returns an RAII
@@ -319,12 +340,19 @@ class OwningCpuBuffer : public Buffer {
     return *this;
   }
 
-  internal::TypeId GetTypeId() const override {
+  // Returns the type id for this class.
+  static internal::TypeId TypeId() {
     return internal::TypeId::Get<OwningCpuBuffer>();
   }
-  bool IsA(internal::TypeId id) const override {
-    return id == internal::TypeId::Get<OwningCpuBuffer>();
-  }
+
+  // Returns the type id for this instance.
+  internal::TypeId GetTypeId() const override { return TypeId(); }
+
+  // Checks if this instance is of the given type id.
+  bool IsA(internal::TypeId id) const override { return id == TypeId(); }
+
+  // Returns the size of the buffer in bytes.
+  absl::StatusOr<size_t> ByteSize() const override { return size(); }
 
   // Locks the buffer so that it's accessible from the CPU and returns an RAII
   // object that allows reading the data.

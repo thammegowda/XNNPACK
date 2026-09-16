@@ -409,8 +409,8 @@ std::optional<size_t> index_of(const C& container, const T& value) {
 
 size_t static_size_of_value(const ynn_value& value) {
   size_t n = 1;
-  for (const auto& extent : value.extents) {
-    if (auto extent_c = as_constant(extent)) {
+  for (size_t i = 0; i < value.extents.size(); ++i) {
+    if (auto extent_c = as_constant(value.extent(i))) {
       n *= *extent_c;
     } else {
       return 0;
@@ -1349,7 +1349,8 @@ void print(std::ostream& os, const ynn_node::iota& op) {}
 
 void print(std::ostream& os, const ynn_node::pack_b& op) {}
 void print(std::ostream& os, const ynn_node::transpose_a& op) {
-  os << "tile_k=" << op.tile_k << " m_dim=" << op.m_dim;
+  os << "tile_m=" << op.tile_m << " tile_k=" << op.tile_k
+     << " m_dim=" << op.m_dim;
 }
 
 void print(std::ostream& os, const ynn_node::dequantize_dot& op) {}
